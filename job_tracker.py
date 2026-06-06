@@ -358,8 +358,14 @@ Job posting text:
 """
 
 
-def extract_experience_claude(text: str, api_key: str) -> float | None:
-    """Use Anthropic Claude to extract min years of experience."""
+_AI_NULL = object()  # sentinel: AI ran successfully but found no experience requirement
+
+
+def extract_experience_claude(text: str, api_key: str):
+    """Use Anthropic Claude to extract min years of experience.
+
+    Returns a float, _AI_NULL (Claude found nothing), or None (call failed).
+    """
     if not HAS_ANTHROPIC:
         log.error("anthropic package not installed. Run: pip install anthropic")
         return None
@@ -381,18 +387,19 @@ def extract_experience_claude(text: str, api_key: str) -> float | None:
             messages=[{"role": "user", "content": text}],
         )
         raw = msg.content[0].text.strip()
-        raw = re.sub(r"```[a-z]*\n?|```", "", raw).strip()
+        raw = re.sub(r"```(?:json)?\n?|```", "", raw).strip()
         if not raw:
-            return None
+            return _AI_NULL
         data = json.loads(raw)
         val = data.get("min_years")
-        return float(val) if val is not None else None
+        return float(val) if val is not None else _AI_NULL
     except Exception as e:
         log.warning(f"Claude extraction error: {e}")
         return None
 
 
-def extract_experience_grok(text: str, api_key: str) -> float | None:
+def extract_experience_grok(text: str, api_key: str):
+    """Returns a float, _AI_NULL (Grok found nothing), or None (call failed)."""
     if not HAS_OPENAI_SDK:
         log.error("openai package not installed. Run: pip install openai")
         return None
@@ -404,9 +411,10 @@ def extract_experience_grok(text: str, api_key: str) -> float | None:
             messages=[{"role": "user", "content": EXPERIENCE_PROMPT.format(text=text)}],
         )
         raw = resp.choices[0].message.content.strip()
-        raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
+        raw = re.sub(r"```(?:json)?\n?|```", "", raw).strip()
         data = json.loads(raw)
-        return data.get("min_years")
+        val = data.get("min_years")
+        return float(val) if val is not None else _AI_NULL
     except Exception as e:
         log.warning(f"Grok extraction error: {e}")
         return None
@@ -432,40 +440,51 @@ def extract_experience_regex(text: str) -> float | None:
     return None
 
 
+def _resolve_ai_result(result, provider_name: str):
+    """Unpack AI result: returns (float|None, did_succeed).
+    _AI_NULL means the AI ran fine but found no requirement → treat as None.
+    None means the AI call itself failed.
+    """
+    if result is _AI_NULL:
+        return None, True
+    if result is None:
+        log.info(f"{provider_name} call failed, falling back to regex")
+        return None, False
+    return result, True
+
+
 def extract_experience(text: str, cfg: configparser.ConfigParser) -> float | None:
     provider = cfg.get("ai", "provider", fallback="claude").lower()
 
     if provider == "grok":
         key = cfg.get("ai", "grok_api_key", fallback="").strip()
         if key:
-            result = extract_experience_grok(text, key)
-            if result is not None:
-                return result
-            log.info("Grok failed, falling back to regex")
+            val, ok = _resolve_ai_result(extract_experience_grok(text, key), "Grok")
+            if ok:
+                return val
         else:
             log.warning("Grok selected but no grok_api_key in config")
 
     elif provider == "claude":
         key = cfg.get("ai", "claude_api_key", fallback="").strip()
         if key:
-            result = extract_experience_claude(text, key)
-            if result is not None:
-                return result
-            log.info("Claude failed, falling back to regex")
+            val, ok = _resolve_ai_result(extract_experience_claude(text, key), "Claude")
+            if ok:
+                return val
         else:
             log.warning("Claude selected but no claude_api_key in config")
 
     elif provider == "both":
         claude_key = cfg.get("ai", "claude_api_key", fallback="").strip()
         if claude_key:
-            result = extract_experience_claude(text, claude_key)
-            if result is not None:
-                return result
+            val, ok = _resolve_ai_result(extract_experience_claude(text, claude_key), "Claude")
+            if ok:
+                return val
         grok_key = cfg.get("ai", "grok_api_key", fallback="").strip()
         if grok_key:
-            result = extract_experience_grok(text, grok_key)
-            if result is not None:
-                return result
+            val, ok = _resolve_ai_result(extract_experience_grok(text, grok_key), "Grok")
+            if ok:
+                return val
 
     return extract_experience_regex(text)
 
@@ -524,15 +543,28 @@ def send_email(jobs: list, cfg: configparser.ConfigParser):
     msg["To"]      = to_addr
     msg.attach(MIMEText(html_body, "html"))
 
+    sent = False
+    # Try STARTTLS (port 587) first
     try:
-        with smtplib.SMTP(smtp_host, smtp_port) as s:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
             s.ehlo()
             s.starttls()
             s.login(smtp_user, smtp_pass)
             s.sendmail(smtp_user, to_addr, msg.as_string())
         log.info(f"Email sent to {to_addr} with {len(jobs)} jobs")
+        sent = True
     except Exception as e:
-        log.error(f"Email send failed: {e}")
+        log.warning(f"STARTTLS on port {smtp_port} failed ({e}), retrying with SSL on port 465…")
+
+    # Fall back to SMTP_SSL (port 465) — needed on some cloud hosts (e.g. Railway)
+    if not sent:
+        try:
+            with smtplib.SMTP_SSL(smtp_host, 465, timeout=30) as s:
+                s.login(smtp_user, smtp_pass)
+                s.sendmail(smtp_user, to_addr, msg.as_string())
+            log.info(f"Email sent (SSL/465) to {to_addr} with {len(jobs)} jobs")
+        except Exception as e:
+            log.error(f"Email send failed: {e}")
 
 
 def desktop_notify(title: str, message: str):
