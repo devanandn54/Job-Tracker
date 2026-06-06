@@ -1,0 +1,19 @@
+# company_name, careers_page_url
+# Add/remove companies below. Lines starting with # are ignored.
+
+# ── Big Tech ──────────────────────────────────────────────────────
+Google,https://careers.google.com/jobs/results/
+Microsoft,https://jobs.careers.microsoft.com/global/en/search
+Amazon,https://www.amazon.jobs/en/search
+Meta,https://www.metacareers.com/jobs
+Apple,https://jobs.apple.com/en-us/search
+
+# ── Mid-size / high-growth ────────────────────────────────────────
+#Stripe,https://stripe.com/jobs/search
+#Airbnb,https://careers.airbnb.com/positions/
+#Databricks,https://www.databricks.com/company/careers/open-positions
+#Figma,https://www.figma.com/careers/#job-openings
+#Notion,https://www.notion.so/careers
+
+# ── Add YOUR target companies here ───────────────────────────────
+# Example: MyTargetCo,https://mytargetco.com/careers

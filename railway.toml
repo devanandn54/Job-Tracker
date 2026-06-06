@@ -1,0 +1,10 @@
+# railway.toml — Railway deployment config
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+# Runs once per day at 23:00 UTC = 6 PM EST (7 PM EDT in summer)
+startCommand = "python job_tracker.py --once"
+cronSchedule = "0 23 * * *"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
