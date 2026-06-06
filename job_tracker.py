@@ -71,6 +71,7 @@ def load_config(path="config.ini") -> configparser.ConfigParser:
         ("email",   "smtp_user"):               "SMTP_USER",
         ("email",   "smtp_password"):           "SMTP_PASSWORD",
         ("email",   "to_address"):              "EMAIL_TO",
+        ("email",   "resend_api_key"):          "RESEND_API_KEY",
     }
     for section, _ in env_map:
         if not cfg.has_section(section):
@@ -211,7 +212,8 @@ JOB_URL_MUST_MATCH = re.compile(
 
 TECHNICAL_ROLE_PATTERN = re.compile(
     r"\b("
-    r"software\s+engineer|swe|ml\s+engineer|ai\s+engineer|"
+    r"software\s+engineer|software\s+development\s+engineer|swe|"
+    r"ml\s+engineer|ai\s+engineer|"
     r"machine\s+learning\s+engineer|deep\s+learning\s+engineer|"
     r"data\s+engineer|data\s+scientist|analytics\s+engineer|"
     r"backend\s+engineer|front[\s\-]?end\s+engineer|full[\s\-]?stack\s+engineer|"
@@ -222,7 +224,10 @@ TECHNICAL_ROLE_PATTERN = re.compile(
     r"computer\s+vision\s+engineer|nlp\s+engineer|llm\s+engineer|"
     r"generative\s+ai\s+engineer|robotics\s+engineer|"
     r"embedded\s+engineer|firmware\s+engineer|"
-    r"mobile\s+engineer|ios\s+engineer|android\s+engineer"
+    r"mobile\s+engineer|ios\s+engineer|android\s+engineer|"
+    r"forward[\s\-]?deployed\s+engineer|"
+    r"algorithm\s+engineer|"
+    r"ml\s+researcher|ai\s+researcher|machine\s+learning\s+researcher"
     r")\b",
     re.I,
 )
@@ -493,35 +498,23 @@ def extract_experience(text: str, cfg: configparser.ConfigParser) -> float | Non
 #  NOTIFICATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def send_email(jobs: list, cfg: configparser.ConfigParser):
-    if not cfg.has_section("email"):
-        return
-    smtp_host = cfg.get("email", "smtp_host", fallback="")
-    if not smtp_host:
-        return
-
-    smtp_port = cfg.getint("email", "smtp_port", fallback=587)
-    smtp_user = cfg.get("email", "smtp_user", fallback="")
-    smtp_pass = cfg.get("email", "smtp_password", fallback="")
-    to_addr   = cfg.get("email", "to_address", fallback=smtp_user)
-
-    html_parts = []
+def _build_email_html(jobs: list) -> tuple[str, str]:
+    """Returns (subject, html_body) for a job alert email."""
+    rows = []
     for j in jobs:
         yrs = f"{j['min_years']:.0f}" if j['min_years'] is not None else "Not specified"
-        html_parts.append(f"""
+        rows.append(f"""
         <tr>
           <td style="padding:8px;border-bottom:1px solid #eee"><b>{j['company']}</b></td>
           <td style="padding:8px;border-bottom:1px solid #eee">{j['title'] or 'N/A'}</td>
           <td style="padding:8px;border-bottom:1px solid #eee">{yrs} yrs</td>
-          <td style="padding:8px;border-bottom:1px solid #eee">
-            <a href="{j['url']}">View Job</a>
-          </td>
+          <td style="padding:8px;border-bottom:1px solid #eee"><a href="{j['url']}">View Job</a></td>
         </tr>""")
 
-    html_body = f"""
+    html = f"""
     <html><body style="font-family:Arial,sans-serif;color:#333">
-    <h2 style="color:#2563eb">🎯 New Job Alerts — {len(jobs)} posting(s) found!</h2>
-    <p>These <b>US-based technical roles</b> have <b>≤ 4 years experience</b> required — perfect for a referral ask:</p>
+    <h2 style="color:#2563eb">New Job Alerts — {len(jobs)} posting(s) found!</h2>
+    <p>These <b>US-based technical roles</b> have <b>&le; 4 years experience</b> required:</p>
     <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
       <thead>
         <tr style="background:#f1f5f9">
@@ -531,40 +524,90 @@ def send_email(jobs: list, cfg: configparser.ConfigParser):
           <th style="padding:10px;text-align:left">Link</th>
         </tr>
       </thead>
-      <tbody>{''.join(html_parts)}</tbody>
+      <tbody>{''.join(rows)}</tbody>
     </table>
     <p style="color:#888;font-size:12px;margin-top:20px">Sent by JobTracker at {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
-    </body></html>
-    """
+    </body></html>"""
 
+    subject = f"{len(jobs)} new US tech job(s) with <=4yr exp — act now for referrals!"
+    return subject, html
+
+
+def _send_via_resend(jobs: list, cfg: configparser.ConfigParser) -> bool:
+    """Send via Resend HTTP API — works on Railway (no SMTP needed). Free: 3k/month."""
+    api_key  = cfg.get("email", "resend_api_key", fallback="").strip()
+    to_addr  = cfg.get("email", "to_address", fallback="").strip()
+    if not api_key or not to_addr:
+        return False
+
+    subject, html = _build_email_html(jobs)
+    try:
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "from": "JobTracker <onboarding@resend.dev>",
+                "to": [to_addr],
+                "subject": subject,
+                "html": html,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        log.info(f"Email sent via Resend to {to_addr} with {len(jobs)} jobs")
+        return True
+    except Exception as e:
+        log.error(f"Resend email failed: {e}")
+        return False
+
+
+def _send_via_smtp(jobs: list, cfg: configparser.ConfigParser) -> bool:
+    """Send via SMTP with STARTTLS→SSL fallback."""
+    smtp_host = cfg.get("email", "smtp_host", fallback="").strip()
+    if not smtp_host:
+        return False
+
+    smtp_port = cfg.getint("email", "smtp_port", fallback=587)
+    smtp_user = cfg.get("email", "smtp_user", fallback="")
+    smtp_pass = cfg.get("email", "smtp_password", fallback="")
+    to_addr   = cfg.get("email", "to_address", fallback=smtp_user)
+
+    subject, html = _build_email_html(jobs)
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🎯 {len(jobs)} new US tech job(s) with ≤4yr exp — act now for referrals!"
+    msg["Subject"] = subject
     msg["From"]    = smtp_user
     msg["To"]      = to_addr
-    msg.attach(MIMEText(html_body, "html"))
+    msg.attach(MIMEText(html, "html"))
 
-    sent = False
-    # Try STARTTLS (port 587) first
     try:
         with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
             s.ehlo()
             s.starttls()
             s.login(smtp_user, smtp_pass)
             s.sendmail(smtp_user, to_addr, msg.as_string())
-        log.info(f"Email sent to {to_addr} with {len(jobs)} jobs")
-        sent = True
+        log.info(f"Email sent (STARTTLS) to {to_addr} with {len(jobs)} jobs")
+        return True
     except Exception as e:
-        log.warning(f"STARTTLS on port {smtp_port} failed ({e}), retrying with SSL on port 465…")
+        log.warning(f"STARTTLS on port {smtp_port} failed ({e}), trying SSL/465…")
 
-    # Fall back to SMTP_SSL (port 465) — needed on some cloud hosts (e.g. Railway)
-    if not sent:
-        try:
-            with smtplib.SMTP_SSL(smtp_host, 465, timeout=30) as s:
-                s.login(smtp_user, smtp_pass)
-                s.sendmail(smtp_user, to_addr, msg.as_string())
-            log.info(f"Email sent (SSL/465) to {to_addr} with {len(jobs)} jobs")
-        except Exception as e:
-            log.error(f"Email send failed: {e}")
+    try:
+        with smtplib.SMTP_SSL(smtp_host, 465, timeout=30) as s:
+            s.login(smtp_user, smtp_pass)
+            s.sendmail(smtp_user, to_addr, msg.as_string())
+        log.info(f"Email sent (SSL/465) to {to_addr} with {len(jobs)} jobs")
+        return True
+    except Exception as e:
+        log.error(f"SMTP email failed: {e}")
+        return False
+
+
+def send_email(jobs: list, cfg: configparser.ConfigParser):
+    if not cfg.has_section("email"):
+        return
+    # Resend first (HTTP-based, works everywhere including Railway)
+    if _send_via_resend(jobs, cfg):
+        return
+    _send_via_smtp(jobs, cfg)
 
 
 def desktop_notify(title: str, message: str):
