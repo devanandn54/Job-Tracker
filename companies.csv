@@ -2,10 +2,14 @@
 # Add/remove companies below. Lines starting with # are ignored.
 
 # ── Big Tech ──────────────────────────────────────────────────────
-Google,https://careers.google.com/jobs/results/
-Microsoft,https://jobs.careers.microsoft.com/global/en/search
-Amazon,https://www.amazon.jobs/en/search
-Meta,https://www.metacareers.com/jobs
+# Google: US-filtered search (avoids scraping non-US postings)
+Google,https://careers.google.com/jobs/results/?location=United+States
+# Microsoft: REST API endpoint (JS-rendered site, API returns real data)
+Microsoft,https://gcsservices.careers.microsoft.com/search/api/v1/search?pg=1&pgSz=20&o=Relevance&flt=true
+# Amazon: JSON search API (JS-rendered site, API returns real data)
+Amazon,https://www.amazon.jobs/en/search.json?category%5B%5D=software-development&country%5B%5D=US&result_limit=20&offset=0&sort=relevant
+# Meta: blocks scraping (400 error) — leave commented until a workaround is found
+#Meta,https://www.metacareers.com/jobs
 Apple,https://jobs.apple.com/en-us/search
 
 # ── Mid-size / high-growth ────────────────────────────────────────

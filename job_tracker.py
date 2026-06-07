@@ -270,10 +270,22 @@ NON_US_LOCATION_PATTERN = re.compile(
     r"canada|united\s+kingdom|\buk\b|germany|france|india|australia|"
     r"singapore|brazil|mexico|netherlands|sweden|norway|denmark|finland|"
     r"switzerland|spain|italy|poland|japan|china|south\s+korea|"
-    r"costa\s+rica|heredia|ireland|argentina|colombia|philippines|romania|"
+    r"costa\s+rica|heredia|argentina|colombia|philippines|romania|"
     r"london|toronto|berlin|paris|bangalore|bengaluru|mumbai|hyderabad|"
     r"sydney|dublin|amsterdam|tel\s+aviv|dubai|manila|bucharest|"
     r"remote\s*[-–]\s*(?!(us|u\.s\.|united\s+states))"
+    r")\b",
+    re.I,
+)
+
+# Titles that strongly indicate a senior role — used as fallback when
+# the job page is JS-rendered and experience text can't be extracted
+SENIOR_TITLE_PATTERN = re.compile(
+    r"\b("
+    r"senior|sr\.|"
+    r"staff\s+(?:software|data|ml|ai|platform|devops|backend|frontend|site\s+reliability)|"
+    r"principal\s+(?:engineer|scientist|architect|researcher)|"
+    r"distinguished\s+engineer|fellow"
     r")\b",
     re.I,
 )
@@ -328,8 +340,16 @@ def is_technical_role(title: str, text: str) -> bool:
     )
 
 
-def is_us_based(text: str) -> bool:
-    """Return True unless the posting explicitly mentions a non-US location."""
+def is_us_based(text: str, url: str = "") -> bool:
+    """Return True unless the posting explicitly mentions a non-US location.
+
+    Checks the job URL path first (reliable for sites like Moody's that embed
+    the city in the URL), then falls back to page text.
+    """
+    if url:
+        url_path = urlparse(url).path
+        if NON_US_LOCATION_PATTERN.search(url_path):
+            return False
     return not bool(NON_US_LOCATION_PATTERN.search(text[:2000]))
 
 
@@ -663,6 +683,49 @@ def desktop_notify(title: str, message: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  JSON API EXTRACTORS  (companies whose career pages are JS-rendered)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fetch_amazon_jobs(url: str) -> list[str]:
+    """Amazon jobs JSON search API → list of job detail URLs."""
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        jobs = resp.json().get("jobs", [])
+        links = [f"https://www.amazon.jobs{j['job_path']}" for j in jobs if j.get("job_path")]
+        log.info(f"  Amazon API: {len(links)} jobs returned")
+        return links
+    except Exception as e:
+        log.warning(f"Amazon API error: {e}")
+        return []
+
+
+def _fetch_microsoft_jobs(url: str) -> list[str]:
+    """Microsoft careers REST API → list of job detail URLs."""
+    try:
+        resp = requests.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        jobs = data.get("operationResult", {}).get("result", {}).get("jobs", [])
+        links = [j["jobDetailsUrl"] for j in jobs if j.get("jobDetailsUrl")]
+        log.info(f"  Microsoft API: {len(links)} jobs returned")
+        return links
+    except Exception as e:
+        log.warning(f"Microsoft API error: {e}")
+        return []
+
+
+def get_job_links(url: str) -> list[str]:
+    """Fetch job URLs from a career page, routing to JSON APIs when available."""
+    if "amazon.jobs" in url and ".json" in url:
+        return _fetch_amazon_jobs(url)
+    if "gcsservices.careers.microsoft.com" in url:
+        return _fetch_microsoft_jobs(url)
+    html = fetch_page(url)
+    return extract_job_links(html, url) if html else []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  CORE LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -687,11 +750,8 @@ def run_once(cfg: configparser.ConfigParser, db: DB, companies: list[dict]):
     for company in companies:
         name, url = company["name"], company["url"]
         log.info(f"Checking {name} → {url}")
-        html = fetch_page(url)
-        if not html:
-            continue
 
-        links = extract_job_links(html, url)
+        links = get_job_links(url)
         log.info(f"  Found {len(links)} job links on career page")
 
         known = db.known_urls(name)
@@ -710,11 +770,18 @@ def run_once(cfg: configparser.ConfigParser, db: DB, companies: list[dict]):
             if not is_technical_role(title, text):
                 log.info(f"  [{name}] '{title}' — skipped (non-technical role)")
                 continue
-            if not is_us_based(text):
+            if not is_us_based(text, job_url):
                 log.info(f"  [{name}] '{title}' — skipped (non-US location)")
                 continue
 
             min_years = extract_experience(text, cfg)
+
+            # When experience can't be extracted (JS-rendered page), use the title
+            # as a signal: clearly senior titles are skipped rather than included
+            if min_years is None and SENIOR_TITLE_PATTERN.search(title or ""):
+                log.info(f"  [{name}] '{title}' — skipped (senior title, exp not found in page)")
+                continue
+
             log.info(f"  [{name}] '{title}' → min_years={min_years}")
             db.save_job(name, job_url, title, min_years, text)
 
