@@ -147,18 +147,51 @@ class DB:
         self.conn.commit()
 
     def pending_notifications(self, max_exp: float = 4.0) -> list:
-        return self.conn.execute(
+        rows = self.conn.execute(
             "SELECT * FROM job_details WHERE notified=0 AND (min_years IS NULL OR min_years <= ?)",
             (max_exp,),
         ).fetchall()
+        # Deduplicate by (company, title) — same job can appear under different URLs
+        seen: set = set()
+        unique = []
+        for row in rows:
+            key = (row["company"], (row["title"] or "").strip().lower())
+            if key not in seen:
+                seen.add(key)
+                unique.append(row)
+        return unique
 
     def mark_notified(self, job_id: int):
-        self.conn.execute("UPDATE job_details SET notified=1 WHERE id=?", (job_id,))
+        # Mark this ID and any duplicate rows with the same company+title as notified
+        row = self.conn.execute(
+            "SELECT company, title FROM job_details WHERE id=?", (job_id,)
+        ).fetchone()
+        if row and row["title"]:
+            self.conn.execute(
+                "UPDATE job_details SET notified=1 WHERE company=? AND title=?",
+                (row["company"], row["title"]),
+            )
+        else:
+            self.conn.execute("UPDATE job_details SET notified=1 WHERE id=?", (job_id,))
         self.conn.commit()
 
 
 def _hash(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def _normalize_url(url: str) -> str:
+    """Strip vendor-specific location/variant codes so duplicate job postings collapse.
+
+    Apple posts the same job under multiple URLs differing only by a trailing
+    location code, e.g. /details/200667030-0157/... and /details/200667030-3956/...
+    Stripping the suffix makes both hash identically.
+    """
+    parsed = urlparse(url)
+    if "jobs.apple.com" in parsed.netloc:
+        path = re.sub(r"(/details/\d+)-\d+", r"\1", parsed.path)
+        return f"{parsed.scheme}://{parsed.netloc}{path}"
+    return url
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -237,8 +270,9 @@ NON_US_LOCATION_PATTERN = re.compile(
     r"canada|united\s+kingdom|\buk\b|germany|france|india|australia|"
     r"singapore|brazil|mexico|netherlands|sweden|norway|denmark|finland|"
     r"switzerland|spain|italy|poland|japan|china|south\s+korea|"
+    r"costa\s+rica|heredia|ireland|argentina|colombia|philippines|romania|"
     r"london|toronto|berlin|paris|bangalore|bengaluru|mumbai|hyderabad|"
-    r"sydney|dublin|amsterdam|tel\s+aviv|dubai|"
+    r"sydney|dublin|amsterdam|tel\s+aviv|dubai|manila|bucharest|"
     r"remote\s*[-–]\s*(?!(us|u\.s\.|united\s+states))"
     r")\b",
     re.I,
@@ -280,7 +314,7 @@ def extract_job_links(html: str, base_url: str) -> list[str]:
             continue
 
         if JOB_URL_MUST_MATCH.search(path):
-            clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            clean = _normalize_url(f"{parsed.scheme}://{parsed.netloc}{parsed.path}")
             links.add(clean)
 
     return list(links)
